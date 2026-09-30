@@ -11,8 +11,13 @@
 - 撤销或到期后旧同意永久失效，不能用于后续请求；
 - 已 waiting（未撤销、两票集齐）的请求到点必开封：后台扫描器与每个写事务
   都会先做确定性的“到点开封”判定，即使处理延迟，之后的撤销或到期扫描也无法使其失效；
+- 资料未开封时，封存人可替换一名指定见证人：新见证人须已注册、非封存人、
+  且不在当前名单（替换后仍是三名不同见证人）；有进行中的开封请求时，
+  被替换者对本次请求的同意立即失效、其他同意保留，有效票不足两票则请求
+  退回待同意（waiting -> pending），新见证人可凭封存摘要补票；已到最早
+  开封时刻且两票已齐的请求先开封并拒绝替换；已过截止时刻的请求按原规则失效；
 - 所有“检查 + 写入”都在 BEGIN IMMEDIATE 短事务内完成，并发同意/撤销/定时开封/
-  到期处理只有一个已提交结果；
+  到期/替换见证人只有一个已提交结果；
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
 """
 import asyncio
@@ -30,7 +35,14 @@ from fastapi.responses import JSONResponse
 
 from .config import settings
 from .db import connect, init_db, now_utc, utc_str, write_tx
-from .schemas import ApproveIn, OpenRequestIn, RegisterIn, RevokeIn, SealIn
+from .schemas import (
+    ApproveIn,
+    OpenRequestIn,
+    RegisterIn,
+    ReplaceWitnessIn,
+    RevokeIn,
+    SealIn,
+)
 
 # ---------------------------------------------------------------------------
 # 工具函数
@@ -194,7 +206,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -572,6 +584,13 @@ def approve_open_request(
                 raise err(409, f"开封请求当前状态为 {req['status']}，同意被拒绝")
             elif req["deadline"] <= now:
                 raise err(409, "已过截止时刻，同意被拒绝，请求即将失效")
+            elif not tx.execute(
+                "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
+                (doc["id"], user["id"]),
+            ).fetchone():
+                # 见证人名单可在资料未开封时被封存人替换：进入写临界区后必须以
+                # “当前名单”为准复核，防止“预校验通过后在锁外被替换”的旧见证人投票。
+                raise err(403, "只有当前指定见证人可以同意")
             elif payload.digest != doc["digest"]:
                 # 不同意即不绑定本次请求：不落库
                 raise err(409, "提交的摘要与封存时摘要不一致，拒绝同意")
@@ -702,6 +721,177 @@ def revoke_open_request(
     if post_commit_error is not None:
         raise post_commit_error
     return {"request_id": request_id, "status": "revoked"}
+
+
+# ---------------------------------------------------------------------------
+# 见证人替换（资料未开封）
+#
+# 封存人可在资料未开封时把一名指定见证人换成新见证人。新见证人必须已注册、
+# 非封存人、且不在当前名单；替换后仍是三名互不相同的见证人。与同意/撤销
+# 相同：临界区内先做确定性到点开封——已到最早开封时刻且两票已齐的请求会
+# 先开封，本次替换随即被拒绝；已过截止时刻的进行中请求按原规则先失效，
+# 再完成替换。被替换者对进行中请求的同意立即删除（失效），其他同意保留，
+# 有效票不足两票时 waiting 退回 pending；旧见证人立刻失去访问与同意权限。
+# ---------------------------------------------------------------------------
+
+
+@app.post("/documents/{doc_id}/witness-replacements")
+def replace_witness(
+    doc_id: int,
+    payload: ReplaceWitnessIn,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    doc = load_doc_for_participant(db, doc_id, user)
+    if doc["owner_id"] != user["id"]:
+        raise err(403, "只有封存人可以替换见证人")
+
+    now = utc_str(now_utc())
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] = {}
+    with write_tx(db) as tx:
+        # 临界区第一步与其他写路径一致：先确定性到点开封。
+        # 用全局解析：与扫描器等价，顺带把已到点的 waiting 请求开封。
+        resolve_due_waiting(tx, now)
+        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if doc["status"] != "sealed":
+            # 资料已开封即不允许替换：无论开封是本临界区刚触发的到点开封，
+            # 还是并发的第二票同意在更早的事务里完成的，结论一致。
+            # 若为前者，开封必须先随本事务提交，故错误延迟到提交后再抛出。
+            post_commit_error = err(409, "资料已开封，无法替换见证人")
+        else:
+            old_row = tx.execute(
+                """SELECT w.id, w.user_id, u.username FROM document_witnesses w
+                   JOIN users u ON u.id = w.user_id
+                   WHERE w.document_id = ? AND u.username = ?""",
+                (doc_id, payload.old_witness),
+            ).fetchone()
+            if old_row is None:
+                raise err(404, "被替换者不在当前见证人名单中")
+
+            new_user = tx.execute(
+                "SELECT id, username FROM users WHERE username = ?",
+                (payload.new_witness,),
+            ).fetchone()
+            if new_user is None:
+                raise err(400, "新见证人尚未注册")
+            if new_user["id"] == user["id"]:
+                raise err(400, "封存人不能同时担任见证人")
+            already = tx.execute(
+                "SELECT 1 FROM document_witnesses WHERE document_id = ? AND user_id = ?",
+                (doc_id, new_user["id"]),
+            ).fetchone()
+            if already is not None:
+                raise err(409, "新见证人已在当前见证人名单中")
+
+            # 进行中的开封请求（pending/waiting）。已过截止时刻的 pending
+            # 请求按原规则在同一临界区内先确定性失效，再完成替换。
+            active = tx.execute(
+                "SELECT * FROM open_requests"
+                " WHERE document_id = ? AND status IN ('pending', 'waiting')"
+                " ORDER BY id DESC LIMIT 1",
+                (doc_id,),
+            ).fetchone()
+            expired_id: int | None = None
+            if active is not None and active["status"] == "pending" and active["deadline"] <= now:
+                tx.execute(
+                    "UPDATE open_requests SET status='expired', resolved_at=? WHERE id=?",
+                    (now, active["id"]),
+                )
+                add_audit(
+                    tx,
+                    actor_id=None,
+                    action="request_expired",
+                    document_id=doc_id,
+                    request_id=active["id"],
+                    detail="替换见证人时确认开封请求已过截止时刻，请求按原规则失效，已有同意作废",
+                )
+                expired_id = active["id"]
+                active = None
+
+            # 替换名单：新见证人占据被替换者的位置，三名互异不变。
+            tx.execute(
+                "UPDATE document_witnesses SET user_id = ? WHERE id = ?",
+                (new_user["id"], old_row["id"]),
+            )
+
+            details = [
+                f"封存人替换见证人：{payload.old_witness} -> {payload.new_witness}",
+                "新见证人已注册且不在原名单，替换后仍为三名互不相同见证人",
+            ]
+
+            req_info: dict[str, Any] | None = None
+            if expired_id is not None:
+                req_info = {
+                    "request_id": expired_id,
+                    "status": "expired",
+                    "approval_count": 0,
+                }
+                details.append(f"进行中的开封请求 {expired_id} 已过截止时刻，按原规则失效")
+            elif active is not None:
+                removed = tx.execute(
+                    "DELETE FROM approvals WHERE request_id = ? AND witness_id = ?",
+                    (active["id"], old_row["user_id"]),
+                ).rowcount
+                if removed:
+                    details.append(
+                        f"被替换者 {payload.old_witness} 对开封请求 {active['id']} 的同意已失效"
+                    )
+
+                count = tx.execute(
+                    "SELECT COUNT(*) AS c FROM approvals WHERE request_id = ?",
+                    (active["id"],),
+                ).fetchone()["c"]
+                req_status = active["status"]
+                if req_status == "waiting" and count < 2:
+                    # 被替换者带走一票后有效票不足两票：待开封退回待同意，
+                    # 新见证人可凭封存摘要为本次请求补票。
+                    tx.execute(
+                        "UPDATE open_requests SET status='pending' WHERE id=?",
+                        (active["id"],),
+                    )
+                    req_status = "pending"
+                    details.append(
+                        f"开封请求 {active['id']} 有效票不足两票，由 waiting 退回 pending，"
+                        "新见证人可凭封存摘要补票"
+                    )
+                else:
+                    details.append("其他见证人对本次请求的同意保留")
+
+                req_info = {
+                    "request_id": active["id"],
+                    "status": req_status,
+                    "approval_count": count,
+                }
+
+            add_audit(
+                tx,
+                actor_id=user["id"],
+                action="witness_replaced",
+                document_id=doc_id,
+                request_id=req_info["request_id"] if req_info else None,
+                detail="；".join(details),
+            )
+
+            witnesses = [
+                row["username"]
+                for row in tx.execute(
+                    """SELECT u.username FROM document_witnesses w
+                       JOIN users u ON u.id = w.user_id
+                       WHERE w.document_id = ? ORDER BY w.position""",
+                    (doc_id,),
+                ).fetchall()
+            ]
+            result = {
+                "document_id": doc_id,
+                "status": "sealed",
+                "witnesses": witnesses,
+                "open_request": req_info,
+            }
+
+    if post_commit_error is not None:
+        raise post_commit_error
+    return result
 
 
 # ---------------------------------------------------------------------------

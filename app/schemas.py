@@ -37,5 +37,12 @@ class ApproveIn(BaseModel):
     digest: str = Field(min_length=1, max_length=128)
 
 
+class ReplaceWitnessIn(BaseModel):
+    """封存人在资料未开封时替换一名指定见证人。"""
+
+    old_witness: str = Field(min_length=1, max_length=64)
+    new_witness: str = Field(min_length=1, max_length=64)
+
+
 class RevokeIn(BaseModel):
     reason: str = Field(default="", max_length=2000)
