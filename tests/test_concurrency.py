@@ -180,6 +180,117 @@ def test_concurrent_approve_vs_revoke_single_outcome(live_server):
         assert [r["action"] for r in records].count("revoked") <= 1
 
 
+def test_concurrent_approve_vs_witness_replacement_single_outcome(live_server):
+    """已保留一票（rp1）；第二票同意（rp2，凑齐即开封）与封存人替换已投票的
+    rp1 同时发生。可串行化的终态只有两个：
+
+    - 同意先提交：两票凑齐立即开封，替换随后被拒（409），名单不变；
+    - 替换先提交：rp1 的同意被删（0 票），rp2 的同意随后落库（仍是有效见证人），
+      请求保持 pending、1 票，由新见证人凭摘要再补一票开封。
+    """
+    base, _ = live_server
+    with httpx.Client(timeout=10) as c:
+        owner = _reg(c, base, "rep-owner")
+        w1 = _reg(c, base, "rp1")
+        w2 = _reg(c, base, "rp2")
+        w3 = _reg(c, base, "rp3")
+        w4 = _reg(c, base, "rp4")  # 新见证人
+        body = "替换赛跑正文 REPLACE-RACE-SECRET"
+        dg = _digest(body)
+        doc_id = c.post(base + "/documents", json={"body": body, "witnesses": ["rp1", "rp2", "rp3"]},
+                        headers={"X-API-Key": owner}).json()["document_id"]
+        deadline = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=30)).isoformat()
+        req_id = c.post(f"{base}/documents/{doc_id}/open-requests",
+                        json={"reason": "替换赛跑", "deadline": deadline},
+                        headers={"X-API-Key": owner}).json()["request_id"]
+        # 先保留一票（即将被替换的 rp1）
+        r = c.post(f"{base}/open-requests/{req_id}/approve", json={"digest": dg},
+                   headers={"X-API-Key": w1})
+        assert r.status_code == 200 and r.json()["approval_count"] == 1
+
+    barrier = threading.Barrier(2)
+
+    def approve():
+        barrier.wait()
+        with httpx.Client(timeout=10) as c:
+            return c.post(f"{base}/open-requests/{req_id}/approve",
+                          json={"digest": dg}, headers={"X-API-Key": w2}).status_code
+
+    def replace():
+        barrier.wait()
+        with httpx.Client(timeout=10) as c:
+            return c.post(f"{base}/documents/{doc_id}/witness-replacements",
+                          json={"replacee": "rp1", "new_witness": "rp4"},
+                          headers={"X-API-Key": owner}).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ap_code, rp_code = list(pool.map(lambda f: f(), [approve, replace]))
+
+    with httpx.Client(timeout=10) as c:
+        h = {"X-API-Key": owner}
+        got = c.get(f"{base}/documents/{doc_id}", headers=h).json()
+        records = c.get(f"{base}/documents/{doc_id}/audit", headers=h).json()["records"]
+        assert ap_code == 200  # rp2 始终是有效见证人，其同意两种顺序下都被接受
+        if got["status"] == "opened":
+            # 同意先到：两票凑齐开封，替换被拒
+            assert rp_code == 409, (ap_code, rp_code)
+            assert got["body"] == body
+            assert got["witnesses"] == ["rp1", "rp2", "rp3"]
+            assert "witness_replaced" not in [r["action"] for r in records]
+        else:
+            # 替换先到：rp1 的票被删，rp2 的票保留为唯一一票，请求仍 pending
+            assert rp_code == 200, (ap_code, rp_code)
+            assert "body" not in got
+            assert got["witnesses"] == ["rp4", "rp2", "rp3"]
+            info = got["latest_open_request"]
+            assert info["status"] == "pending" and info["approval_count"] == 1
+            # 旧见证人 rp1 失去访问与同意权
+            assert c.get(f"{base}/documents/{doc_id}", headers={"X-API-Key": w1}
+                         ).status_code == 403
+            # 新见证人 rp4 凭封存摘要补上第二票 -> 开封（沿用本次请求）
+            r = c.post(f"{base}/open-requests/{req_id}/approve", json={"digest": dg},
+                       headers={"X-API-Key": w4})
+            assert r.status_code == 200 and r.json()["status"] == "opened", r.text
+            got = c.get(f"{base}/documents/{doc_id}", headers=h).json()
+            assert got["body"] == body
+            names = [a["username"] for a in got["witness_approvals"]]
+            assert names == ["rp2", "rp4"]
+
+
+def test_concurrent_double_replacement_single_winner(live_server):
+    """封存人并发把两个不同席位替换成同一新见证人：只能成功一个
+    （第二个会因新见证人已在名单/名单已被并发修改被拒），最终仍为三名不同见证人。"""
+    base, _ = live_server
+    with httpx.Client(timeout=10) as c:
+        owner = _reg(c, base, "dr-owner")
+        keys = [_reg(c, base, f"dr{i}") for i in range(1, 4)]
+        new = _reg(c, base, "drnew")
+        doc_id = c.post(base + "/documents",
+                        json={"body": "并发替换 DR-SECRET",
+                              "witnesses": ["dr1", "dr2", "dr3"]},
+                        headers={"X-API-Key": owner}).json()["document_id"]
+
+    barrier = threading.Barrier(2)
+
+    def swap(old):
+        barrier.wait()
+        with httpx.Client(timeout=10) as c:
+            return c.post(f"{base}/documents/{doc_id}/witness-replacements",
+                          json={"replacee": old, "new_witness": "drnew"},
+                          headers={"X-API-Key": owner}).status_code
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        codes = list(pool.map(swap, ["dr1", "dr2"]))
+
+    # 恰好一个成功（200）；另一个被拒：409（锁前快照陈旧、锁内复核冲突）或
+    # 400（快照时 drnew 已被另一事务放进名单），两者都不改最终名单。
+    assert codes.count(200) == 1, codes
+    assert all(code in (400, 409) for code in codes if code != 200), codes
+    with httpx.Client(timeout=10) as c:
+        got = c.get(f"{base}/documents/{doc_id}", headers={"X-API-Key": owner}).json()
+    assert len(set(got["witnesses"])) == 3 and "drnew" in got["witnesses"]
+
+
 def test_waiting_opens_automatically_and_survives_late_revoke(live_server):
     """真实后台扫描：waiting 到点自动开封；即使处理延迟，迟到的撤销也不能作废。"""
     base, _ = live_server

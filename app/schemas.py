@@ -33,6 +33,13 @@ class OpenRequestIn(BaseModel):
         return self
 
 
+class WitnessReplaceIn(BaseModel):
+    # 被替换的见证人账号（必须在当前名单中）与新见证人账号
+    # （必须已注册、非封存人、不在当前名单，且二者不能相同）。
+    replacee: str = Field(min_length=1, max_length=64)
+    new_witness: str = Field(min_length=1, max_length=64)
+
+
 class ApproveIn(BaseModel):
     digest: str = Field(min_length=1, max_length=128)
 

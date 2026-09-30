@@ -3,6 +3,7 @@
 本地账号、密钥操作的资料封存/开封服务。封存后正文不可修改、不可（在开封前）被读取；
 开封必须由封存人发起请求（理由 + 截止时刻，可选**最早开封时刻**），并在截止前取得
 **两名不同指定见证人**分别同意；同意必须绑定本次请求与封存时的摘要。
+封存后若指定见证人无法继续履职，封存人可在资料**未开封**时替换见证人（见下文）。
 技术栈：Python 3.11 + FastAPI + SQLite。
 
 ## 安全与业务规则
@@ -17,11 +18,13 @@
 | 最早开封时刻（可选） | `earliest_open_at`：带时区，不早于提交时刻且严格早于 `deadline`；不填时行为不变（两票集齐即开封） |
 | 两票同意 | 截止前两名**不同**见证人各同意一次才开封；`UNIQUE(request_id, witness_id)` 保证同一人重试只计一次 |
 | 同意绑定摘要 | 同意时须提交封存摘要，服务端比对一致才记录，防止对被篡改内容背书 |
+| 见证人替换 | 资料未开封时封存人可提交“被替换者 + 新见证人”；新见证人须已注册、非封存人、不在当前名单，替换后仍为三名不同见证人；被替换者对进行中请求的同意失效、其他同意保留 |
+| 替换与进行中请求 | 到最早开封时刻且两票已齐的请求先开封并拒绝替换；票不足两票时请求退回待同意，新见证人凭封存摘要为**本次**请求投票；已过截止时刻的请求按原规则失效 |
 | 定时开封 | 填了 `earliest_open_at` 时，两票在该时刻前集齐只进入 `waiting`（待开封）；到点自动开封。到点时不足两票的，截止前补齐第二票时立即开封 |
-| 到点必开封 | 到点前未撤销且已集齐两票的请求，自到点起只能开封：后台扫描器与每个写事务都先做确定性到点判定，即使后台处理延迟，之后的撤销或到期扫描也不能使其失效 |
+| 到点必开封 | 到点前未撤销且已集齐两票的请求，自到点起只能开封：后台扫描器与每个写事务都先做确定性到点判定，即使后台处理延迟，之后的撤销/替换或到期扫描也不能使其失效 |
 | 撤销/到期作废 | 到点**之前**封存人可撤销；过截止时刻始终不足两票则置为 `revoked`/`expired`，其同意永久失效；新请求从 0 票开始 |
-| 拒绝且状态不变 | 失效凭据(401)、非见证人(403)、无效时限(400/422)、重复开封(409) 等任何拒绝路径都不写数据（到点自动开封的提交除外：开封先落库，拒绝在提交后返回） |
-| 并发只产生一个结果 | 全部“检查 + 写入”在 SQLite `BEGIN IMMEDIATE` 短事务内完成；并发同意/撤销/定时开封/到期只有一个已提交终态 |
+| 拒绝且状态不变 | 失效凭据(401)、非见证人(403)、无效时限/参数(400/422)、重复开封(409) 等任何拒绝路径都不写数据（到点自动开封的提交除外：开封先落库，拒绝在提交后返回） |
+| 并发只产生一个结果 | 全部“检查 + 写入”在 SQLite `BEGIN IMMEDIATE` 短事务内完成（含替换与同意赛跑、并发替换）；并发同意/撤销/替换/定时开封/到期只有一个已提交终态 |
 | 操作留痕、重启一致 | 每次成功操作按自增序号追加 `audit_log`；WAL 持久化，重启时先跑一轮恢复扫描，状态、票数、审计顺序完全一致 |
 
 ### 请求状态机
@@ -29,10 +32,14 @@
 ```
 pending  ──(两票集齐，未设最早开封时刻 或 已到最早开封时刻)──▶ opened
 pending  ──(两票集齐但未到 earliest_open_at)───────────────▶ waiting
-waiting  ──(到达 earliest_open_at；扫描器或任意写事务触发)──▶ opened（不可再撤销/过期）
+waiting  ──(到达 earliest_open_at；扫描器或任意写事务触发)──▶ opened（不可再撤销/过期/替换）
+waiting  ──(替换已投票见证人致有效票不足两票)───────────────▶ pending（旧票失效、其余票保留）
 pending  ──(封存人在截止前撤销)─────────────────────────────▶ revoked
 pending  ──(过 deadline 仍不足两票)─────────────────────────▶ expired
 ```
+
+见证人替换本身不改变资料状态（始终 `sealed`），只更新见证人名单并按需调整
+进行中请求的票数/状态；`pending` 下票数增减不产生新的状态名，票被删光仍是 `pending`。
 
 后台扫描器（默认每秒一次）在一轮内先把到点的 `waiting` 请求确定性开封，
 再把已到截止时刻仍 `pending` 的请求置为 `expired`；
@@ -91,13 +98,15 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/documents/{id}/open-requests` | 封存人提交开封请求：`{reason, deadline, earliest_open_at?}` |
 | POST | `/open-requests/{id}/approve` | 见证人同意：`{digest}`（须等于封存摘要）；第二票可能返回 `waiting` 或 `opened` |
 | POST | `/open-requests/{id}/revoke` | 封存人撤销：`{reason?}` |
+| POST | `/documents/{id}/witness-replacements` | 封存人在未开封时替换见证人：`{replacee, new_witness}`，返回当前名单、请求状态与有效票数 |
 | GET | `/documents/{id}/audit` | 按顺序返回该资料的全部操作记录 |
 
 状态码：成功 `200/201`；参数校验失败 `422`（如时间不带时区、`earliest_open_at`
 不早于 `deadline`）；业务校验失败 `400`（如三人不互异、截止时刻已过、最早开封时刻
-早于当前）；未认证 `401`；无权/不可见 `403`；冲突（重复同意、重复开封、
-请求已撤销/到期、waiting 下再同意、已有进行中请求等）`409`。错误体统一为
-`{"detail": "..."}`，不含任何正文内容。
+早于当前、替换双方相同/被替换者不在名单/新见证人已在名单或未注册或为封存人）；
+未认证 `401`；无权/不可见 `403`；冲突（重复同意、重复开封、请求已撤销/到期、
+waiting 下再同意、已有进行中请求、资料已开封或两票已齐到点后再替换、
+并发替换导致名单已变等）`409`。错误体统一为 `{"detail": "..."}`，不含任何正文内容。
 
 ### 最早开封时刻（earliest_open_at）
 
@@ -132,6 +141,66 @@ curl -sS -X POST $BASE/open-requests/1/approve -H "X-API-Key: $W2_KEY" \
 curl -sS $BASE/documents/1 -H "X-API-Key: $OWNER_KEY"
 # 到达最早开封时刻后（扫描间隔内）再查 -> status=opened，可见 body
 ```
+
+### 封存后替换见证人（本轮新增）
+
+封存后、开封前，封存人若发现指定见证人无法继续履职，可提交“被替换者 + 新见证人”。
+
+**请求**：`POST /documents/{id}/witness-replacements`，头 `X-API-Key` 须为封存人：
+
+```json
+{ "replacee": "carol", "new_witness": "erin" }
+```
+
+资格与状态规则：
+
+- 资料必须仍为 `sealed`；新见证人须**已注册、非封存人、不在当前名单**，被替换者须在
+  当前名单，`replacee != new_witness`，替换后仍是三名不同见证人（沿用原席位 `position`）。
+- 无进行中的开封请求时直接替换；`open_request` 返回 `null`。
+- 有进行中（`pending`/`waiting`）的开封请求时：
+  - **到最早开封时刻且两票已齐**的请求在同一临界区内**先开封**，替换随后返回 `409`
+    （开封先落库，名单不变）；
+  - 否则删除**被替换者对本次请求的同意**，其他同意保留；有效票不足两票时，`waiting`
+    请求退回 `pending`（待同意）；
+  - 新见证人随后用**现有** `POST /open-requests/{id}/approve` 接口、凭**封存摘要**为
+    **本次请求**投票（沿用原 `request_id`，不另起请求）；
+  - 已过 `deadline` 仍 `pending` 的请求按原规则确定性 `expired`，替换照常完成，新请求
+    仍从 0 票开始。
+- 替换成功后旧见证人**立即失去**本资料访问（`GET` 返回 `403`）与同意权限（`approve`
+  返回 `403`，且该判定在写事务内对并发赛跑同样生效）。
+- 成功返回当前名单、替换结果与（若有）进行中请求的状态和有效票数；变更写
+  `witness_replaced` 审计记录，退回待同意另写 `request_back_to_pending`。
+  任何拒绝都不改状态，且错误响应不含正文。
+
+```bash
+# 无进行中请求：直接替换
+curl -sS -X POST $BASE/documents/1/witness-replacements \
+  -H "X-API-Key: $OWNER_KEY" -H 'Content-Type: application/json' \
+  -d '{"replacee":"carol","new_witness":"erin"}'
+# -> {"document_id":1,"status":"sealed",
+#     "witnesses":["bob","erin","dave"],
+#     "replaced":{"from":"carol","to":"erin"},
+#     "open_request":null}
+
+# 进行中（waiting，两票在最早开封时刻前集齐）替换一名已投票见证人
+curl -sS -X POST $BASE/documents/2/witness-replacements \
+  -H "X-API-Key: $OWNER_KEY" -H 'Content-Type: application/json' \
+  -d '{"replacee":"erin","new_witness":"carol"}'
+# -> {"status":"sealed","witnesses":["bob","carol","dave"], ...,
+#     "open_request":{"request_id":7,"status":"pending",
+#                     "earliest_open_at":"…","approval_count":1,"required":2}}
+
+# 新见证人凭封存摘要为【本次请求】投票，两票重新集齐
+curl -sS -X POST $BASE/open-requests/7/approve -H "X-API-Key: $CAROL_KEY" \
+  -H 'Content-Type: application/json' -d '{"digest":"ab12…"}'
+# -> {"approval_count":2,"status":"waiting","earliest_open_at":"…"}
+
+# 旧见证人立即无权
+curl -sS -o /dev/null -w '%{http_code}\n' $BASE/documents/2 -H "X-API-Key: $ERIN_KEY"
+# -> 403
+```
+
+可直接运行的端到端示例（服务启动后）：`python3 examples/demo_replace.py [base_url]`。
 
 ### 调用示例（curl）
 
@@ -184,6 +253,7 @@ curl -sS $BASE/documents/1/audit -H "X-API-Key: $OWNER_KEY"
 bash examples/demo.sh                    # curl 版（未设最早开封时刻的基础流程）
 python3 examples/demo.py                 # 纯标准库 Python 版
 python3 examples/demo_scheduled.py       # 最早开封时刻：waiting -> 自动开封；补票立即开封
+python3 examples/demo_replace.py         # 封存后替换见证人：直接替换/退回待同意/到点先开封
 ```
 
 ### 典型拒绝场景
@@ -206,8 +276,12 @@ python -m pytest -q
 测试覆盖：注册与密钥、封存校验、两票开封全流程、重复同意、撤销后旧同意失效、
 到期失效、最早开封时刻校验、`waiting` 待开封与到点自动开封、到点时票不足补齐
 立即开封、迟到撤销/迟到扫描不能作废已到点开封、停机期间到点的重启恢复、
-开封前正文零泄露、审计顺序，以及基于真实 uvicorn + 多线程的
-**并发同意/同意撤销赛跑**（验证只产生一个已提交终态）和**重启一致性**。
+开封前正文零泄露、审计顺序，以及**封存后替换见证人**（资格校验、无请求直接替换、
+被替换者同意失效/其他同意保留、票不足退回待同意由新见证人凭摘要投票、
+waiting 到点两票已齐先开封并拒绝替换、过期请求按原规则失效、旧见证人即时失去权限、
+链式替换仍为三名不同见证人、审计记录），并包含基于真实 uvicorn + 多线程的
+**并发同意/同意撤销赛跑、同意/替换赛跑、并发双替换只成一个**（验证只产生一个已提交终态）
+和**重启一致性**。
 
 ## 项目结构
 
@@ -219,8 +293,8 @@ app/
   main.py       # FastAPI 路由、认证、定时开封+到期扫描器、全部业务规则
 init_db.py      # 幂等初始化入口
 entrypoint.sh   # 容器入口（初始化 + uvicorn）
-examples/       # demo.sh / demo.py / demo_scheduled.py 端到端调用示例
-tests/          # pytest 测试（功能、并发、重启）
+examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace.py 端到端调用示例
+tests/          # pytest 测试（功能、替换见证人、并发、重启）
 Dockerfile
 docker-compose.yml
 ```
